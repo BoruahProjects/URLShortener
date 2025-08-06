@@ -108,11 +108,11 @@ Follow these steps to deploy the URL shortener on Cloudflare.
 1.  Go to **Workers & Pages** and click **Create application**.
 2.  Select **Create Worker**.
 3.  Give your Worker a name (e.g., `url-shortener-api`) and deploy it.
-4.  Go to the Worker's settings and click on the **Variables** tab.
-5.  Under **D1 Database Bindings**, click **Add binding**.
+4.  Go to the Worker's **Bindings** tab.
+5.  Click on **Add binding** and select **D1 Database**, .
     *   **Variable name**: `DB`
     *   **D1 Database**: Select the database you created in Step 1.
-6.  Under **Environment Variables**, add the following secrets for your admin credentials. You will need to generate SHA-256 hashes for your chosen username and password.
+6.  Goto **Settings** and **Variables and Secrets**, add the following secrets for your admin credentials. You will need to generate SHA-256 hashes for your chosen username and password.
     
     *   `ADMIN_USERNAME_HASH`: The SHA-256 hash of your desired admin username.
     *   `ADMIN_PASSWORD_HASH`: The SHA-256 hash of your desired admin password.
