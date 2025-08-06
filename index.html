@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>URL Shortener</title>
+    <link rel="icon" type="image/x-icon" href="./favicon.ico">
+    <link rel="stylesheet" href="./style.css">
+    <meta http-equiv="Content-Security-Policy" content="
+        default-src 'self';
+        script-src 'self';
+        style-src 'self' 'unsafe-inline';
+        connect-src 'self' https://links.domain.com;
+        img-src 'self' data:;
+        font-src 'self';
+    ">
+</head>
+<body>
+    <div id="login-view" style="display: none;">
+        <div class="login-container">
+            <h2>URL Shortener</h2>
+            <p>Enter your credentials to continue.</p>
+            <form id="login-form">
+                <input type="text" name="username" placeholder="Username" required class="admin-username-input centered-input" />
+                <input type="password" name="password" placeholder="Password" required class="admin-password-input centered-input" />
+                <div id="login-error-message" class="error" style="display: none;"></div>
+                <button type="submit" id="loginButton">Login</button>
+            </form>
+        </div>
+    </div>
+
+    <div id="dashboard-view" style="display: none;">
+        <header class="dashboard-header">
+            <h1 id="header-title">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24px" height="24px" fill="currentColor"><path d="M10.59,13.41C11,13.8 11,14.44 10.59,14.83C10.2,15.22 9.56,15.22 9.17,14.83L5.64,11.3C5.25,10.91 5.25,10.27 5.64,9.88C6.03,9.49 6.67,9.49 7.06,9.88L10.59,13.41M13.41,10.59C13,10.2 13,9.56 13.41,9.17C13.8,8.78 14.44,8.78 14.83,9.17L18.36,12.7C18.75,13.09 18.75,13.73 18.36,14.12C17.97,14.51 17.33,14.51 16.94,14.12L13.41,10.59M19.78,4.22C17.61,2.05 14.32,2.05 12.15,4.22L10.03,6.34L11.44,7.76L13.56,5.64C14.93,4.27 17,4.27 18.36,5.64C19.73,7 19.73,9.09 18.36,10.45L16.24,12.58L17.66,14L19.78,11.88C21.95,9.71 21.95,6.39 19.78,4.22M6.34,10.03L4.22,12.15C2.05,14.32 2.05,17.61 4.22,19.78C6.39,21.95 9.69,21.95 11.86,19.78L13.97,17.66L12.56,16.24L10.45,18.36C9.09,19.73 7,19.73 5.64,18.36C4.27,17 4.27,14.91 5.64,13.55L7.76,11.44L6.34,10.03Z" /></svg>
+                <span>URL Shortener</span>
+            </h1>
+            <button id="logoutButton" class="button-danger">
+                <svg xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 0 24 24" width="24px"><path d="M0 0h24v24H0V0z" fill="none"></path><path d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5-5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z"></path></svg>
+                <span>Logout</span>
+            </button>
+        </header>
+
+        <main class="container">
+            <div class="toolbar">
+                <div class="toolbar-left">
+                    <button id="createLinkButton" class="button-apply">
+                        <svg xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 0 24 24" width="24px"><path d="M0 0h24v24H0V0z" fill="none"></path><path d="M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z"></path></svg>
+                        <span>Create Short URL</span>
+                    </button>
+                    <button id="createFolderButton" class="button-secondary">
+                        <svg xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 0 24 24" width="24px"><path d="M0 0h24v24H0V0z" fill="none"></path><path d="M20 6h-8l-2-2H4c-1.11 0-1.99.89-1.99 2L2 18c0 1.11.89 2 2 2h16c1.11 0 2-.89 2-2V8c0-1.11-.89-2-2-2zm-1 8h-3v3h-2v-3h-3v-2h3V9h2v3h3v2z"></path></svg>
+                        <span>Create Folder</span>
+                    </button>
+                    <button id="backButton" class="button-secondary" style="display: none;">
+                        <svg xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 0 24 24" width="24px"><path d="M0 0h24v24H0V0z" fill="none"></path><path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"></path></svg>
+                        <span>Back</span>
+                    </button>
+                </div>
+                <div class="toolbar-right">
+                    <div class="dropdown">
+                        <button id="viewOptionsButton" class="button-secondary">
+                            <svg xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 0 24 24" width="24px" fill="currentColor"><path d="M0 0h24v24H0V0z" fill="none"/><path d="M3 18h6v-2H3v2zM3 6v2h18V6H3zm0 7h12v-2H3v2z"/></svg>
+                            <span>View Options</span>
+                        </button>
+                        <div id="viewOptionsMenu" class="dropdown-menu" style="display: none;">
+                            <a href="#" id="sortDropdownOption">Sort</a>
+                            <a href="#" id="filterDropdownOption">Filter</a>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div id="multi-select-actions" class="multi-select-bar" style="display: none;">
+                <span id="selected-count"></span>
+                <div class="actions">
+                    <button id="moveSelectedButton" class="button-secondary">Move</button>
+                    <button id="deleteSelectedButton" class="button-danger">Delete</button>
+                    <button id="cancelSelectionButton" class="button-secondary">Cancel</button>
+                </div>
+            </div>
+
+            <div class="content-card" id="sort-container" style="display: none;">
+                <div id="sort-section" style="display: none;">
+                    <div class="sort-inputs-container">
+                        <div class="sort-group">
+                            <label for="sortBy">Sort By</label>
+                            <select id="sortBy">
+                                <option value="created_at">Creation Date</option>
+                                <option value="clicks">Clicks</option>
+                                <option value="id">Path Name</option>
+                            </select>
+                        </div>
+                        <div class="sort-group">
+                            <label for="sortOrder">Order</label>
+                            <select id="sortOrder">
+                                <option value="DESC">Descending</option>
+                                <option value="ASC">Ascending</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="sort-actions">
+                        <button class="button-apply" id="applySortButton">Apply Sort</button>
+                        <button class="button-secondary" id="closeSortButton">Close</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="content-card" id="filter-container" style="display: none;">
+                <div id="filter-section" style="display: none;">
+                    <div class="filter-inputs-container">
+                        <div class="filter-group">
+                            <label for="searchQuery">Search (Path/URL):</label>
+                            <input type="text" id="searchQuery" placeholder="Keyword" />
+                        </div>
+                        <div class="filter-group">
+                            <label for="minClicks">Min Clicks:</label>
+                            <input type="number" id="minClicks" min="0" placeholder="Min" />
+                        </div>
+                        <div class="filter-group">
+                            <label for="maxClicks">Max Clicks:</label>
+                            <input type="number" id="maxClicks" min="0" placeholder="Max" />
+                        </div>
+                        <div class="filter-group">
+                            <label for="expiryStatus">Expiry Status:</label>
+                            <select id="expiryStatus">
+                                <option value="all">All</option>
+                                <option value="never">Never Expires</option>
+                                <option value="expiresSoon">Expires Soon (next 24h)</option>
+                                <option value="expired">Expired</option>
+                            </select>
+                        </div>
+                        <div class="filter-group">
+                            <label for="creationDateFrom">Created From:</label>
+                            <input type="date" id="creationDateFrom" />
+                        </div>
+                        <div class="filter-group">
+                            <label for="creationDateTo">Created To:</label>
+                            <input type="date" id="creationDateTo" />
+                        </div>
+                    </div>
+                    <div class="filter-actions">
+                        <button class="button-apply" id="applyFiltersButton">Apply Filters</button>
+                        <button class="button-clear" id="clearFiltersButton">Clear Filters</button>
+                        <button class="button-secondary" id="closeFilterButton">Close</button>
+                    </div>
+                </div>
+            </div>
+            <div class="content-card">
+                <div id="spinner-container" class="spinner-container">
+                    <div class="spinner"></div>
+                </div>
+                <div id="loading-message" style="display: none; color: #0cf;">Loading...</div>
+                <div id="error-message" class="error" style="display: none;"></div>
+
+                <table id="links-table">
+                    <thead>
+                        <tr>
+                            <th><input type="checkbox" id="selectAllCheckbox" /></th>
+                            <th>Name / Path</th>
+                            <th>Original URL</th>
+                            <th>Password</th>
+                            <th>Clicks / Max</th>
+                            <th>Expiry</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                    </tbody>
+                </table>
+            </div>
+
+            <div id="pagination-controls" class="pagination-controls" style="display: none;">
+                <button id="prev-page-button" class="button">
+                    <svg xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 0 24 24" width="24px" fill="currentColor"><path d="M0 0h24v24H0V0z" fill="none"/><path d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12l4.58-4.59z"/></svg>
+                    <span>Previous</span>
+                </button>
+                <span id="page-info"></span>
+                <button id="next-page-button" class="button">
+                    <span>Next</span>
+                    <svg xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 0 24 24" width="24px" fill="currentColor"><path d="M0 0h24v24H0V0z" fill="none"/><path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6-6-6z"/></svg>
+                </button>
+            </div>
+        </main>
+
+        <footer class="dashboard-footer">
+            <p>&copy; <span id="current-year"></span> URL Shortener. All rights reserved.</p>
+        </footer>
+    </div>
+
+    <div id="editModal" class="modal">
+        <div class="modal-content">
+            <span class="close-button">&times;</span>
+            <h2 id="modal-edit-title">Edit Short URL: </h2>
+            <div id="modal-error-message" class="error" style="display: none;"></div>
+            <form id="modal-edit-form">
+                <input type="hidden" name="originalKey" id="modalOriginalKey" />
+                <label for="modalShortPath">Short Path:</label>
+                <div class="input-with-icon">
+                    <input type="text" id="modalShortPath" name="shortPath" placeholder="Custom short path" pattern="[a-zA-Z0-9\-]+" title="Only alphanumeric characters and hyphens allowed" required />
+                    <span class="icon-button generate-shortpath" title="Generate random path">
+                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" height="1.5em" fill="currentColor"><path d="M17.65,6.35C16.2,4.9,14.21,4,12,4A8,8,0,0,0,4,12a8,8,0,0,0,8,8c3.73,0,6.84-2.55,7.73-6H17.65a6,6,0,0,1-11.65-0.35A6,6,0,0,1,12,6c1.66,0,3.14.69,4.22,1.78L13,11h7V4Z"/></svg>
+                    </span>
+                </div>
+                <label for="modalLongUrl">Original URL:</label>
+                <input type="url" id="modalLongUrl" name="longUrl" required />
+                <label for="modalPassword">New Password:</label>
+                <div class="input-with-icon">
+                    <input type="password" id="modalPassword" name="password" placeholder="New password (optional)" />
+                    <span class="icon-button toggle-password" title="Show/Hide Password">&#128065;</span>
+                </div>
+                <button type="button" id="removePasswordButton" class="button-danger" style="margin-top: 10px; width: 100%;">Remove Password</button>
+                <label for="modalExpiresAt">Expire At (leave blank to remove expiry):</label>
+                <input type="datetime-local" id="modalExpiresAt" name="expiresAt" />
+                <label for="modalMaxClicks">Max Clicks (leave blank or 0 to remove limit):</label>
+                <input type="number" id="modalMaxClicks" name="maxClicks" min="0" placeholder="Max clicks (optional)" />
+                <button type="submit">Update Short URL</button>
+            </form>
+        </div>
+    </div>
+    <div id="createModal" class="modal">
+        <div class="modal-content">
+            <span class="close-button">&times;</span>
+            <h2>Create Short URL</h2>
+            <div id="modal-create-error" class="error" style="display: none;"></div>
+            <form id="modal-create-form">
+                <label for="createLongUrl">Original URL:</label>
+                <input type="url" id="createLongUrl" name="longUrl" placeholder="Long URL (e.g., https://example.com)" required />
+                <label for="createShortPath">Custom Short Path:</label>
+                <div class="input-with-icon">
+                    <input type="text" id="createShortPath" name="shortPath" placeholder="Custom short path (e.g., mylink)" pattern="[a-zA-Z0-9\-]+" title="Only alphanumeric characters and hyphens allowed" required />
+                    <span class="icon-button generate-shortpath" title="Generate random path">
+                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" height="1.5em" fill="currentColor"><path d="M17.65,6.35C16.2,4.9,14.21,4,12,4A8,8,0,0,0,4,12a8,8,0,0,0,8,8c3.73,0,6.84-2.55,7.73-6H17.65a6,6,0,0,1-11.65-0.35A6,6,0,0,1,12,6c1.66,0,3.14.69,4.22,1.78L13,11h7V4Z"/></svg>
+                    </span>
+                </div>
+                <label for="createPassword">Password for Short Link (optional):</label>
+                <div class="input-with-icon">
+                    <input type="password" id="createPassword" name="password" placeholder="Password for short link (optional)" />
+                    <span class="icon-button toggle-password" title="Show/Hide Password">&#128065;</span>
+                </div>
+                <label for="createExpiresAt">Expire At (optional):</label>
+                <input type="datetime-local" id="createExpiresAt" name="expiresAt" title="Set a specific date and time for the link to expire." />
+                <label for="createMaxClicks">Max Clicks (optional):</label>
+                <input type="number" id="createMaxClicks" name="maxClicks" placeholder="Max clicks (e.g., 10, optional)" min="0" />
+                <button type="submit">Create Link</button>
+            </form>
+        </div>
+    </div>
+    <div id="create-folder-modal" class="modal">
+        <div class="modal-content">
+            <span class="close-button">&times;</span>
+            <h2>Create New Folder</h2>
+            <input type="text" id="new-folder-name-input" placeholder="Folder Name" required />
+            <button id="confirm-create-folder" class="button-apply">Create</button>
+        </div>
+    </div>
+    <div id="move-modal" class="modal">
+        <div class="modal-content">
+             <span class="close-button">&times;</span>
+            <h2 id="move-modal-title">Move Items To:</h2>
+            <div id="folder-tree-container"></div>
+            <button id="confirm-move-button" class="button-apply">Move Here</button>
+        </div>
+    </div>
+    <div id="delete-modal" class="modal">
+        <div class="modal-content">
+            <span class="close-button">&times;</span>
+            <h2>Confirm Deletion</h2>
+            <p id="delete-modal-text">Are you sure you want to delete the selected item(s)? This action is permanent.</p>
+            <div class="modal-actions">
+                <button id="cancel-delete-button" class="button-secondary">Cancel</button>
+                <button id="confirm-delete-button" class="button-danger">Delete</button>
+            </div>
+        </div>
+    </div>
+    <div id="resultModal" class="modal">
+        <div class="modal-content">
+            <span class="close-button">&times;</span>
+            <h2>Short URL Created!</h2>
+            <p>Your new short URL is ready:</p>
+            <input id="resultShortUrl" readonly>
+            <button id="copyUrlButton" class="button-apply">Copy to Clipboard</button>
+        </div>
+    </div>
+
+    <div id="rename-folder-modal" class="modal">
+        <div class="modal-content">
+            <span class="close-button">&times;</span>
+            <h2>Rename Folder</h2>
+            <input type="text" id="new-folder-name-input-rename" placeholder="New Folder Name" required />
+            <button id="confirm-rename-folder-btn" class="button-apply">Rename</button>
+        </div>
+    </div>
+
+    <script src="./dashboard.js" defer></script>
+</body>
+</html>
