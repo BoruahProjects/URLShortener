@@ -1,509 +1,705 @@
 const SESSION_TOKEN_TTL_SECONDS = 3600;
-const MAX_FOLDER_DEPTH = 10;
-const MAX_ITEMS_PER_FOLDER = 500;
+const IDLE_SESSION_TIMEOUT_SECONDS = 900;
 const MAX_PATH_LENGTH = 200;
-const IDLE_SESSION_TIMEOUT_SECONDS = 10;
+const PBKDF2_ITERATIONS = 100_000;
+const ITEMS_PER_PAGE = 13;
+const PAGES_BASE_URL = 'https://short.yourdomain.com';
 
-async function timingSafeEqual(a, b) {
-    if (typeof a !== 'string' || typeof b !== 'string') return false;
-    const encoder = new TextEncoder();
-    const aEncoded = encoder.encode(a);
-    const bEncoded = encoder.encode(b);
-    const aHashed = await crypto.subtle.digest('SHA-256', aEncoded);
-    const bHashed = await crypto.subtle.digest('SHA-256', bEncoded);
-    if (aHashed.byteLength !== bHashed.byteLength) return false;
-    const aView = new Uint8Array(aHashed);
-    const bView = new Uint8Array(bHashed);
-    let diff = 0;
-    for (let i = 0; i < aView.length; i++) {
-        diff |= aView[i] ^ bView[i];
-    }
-    return diff === 0;
+const te = new TextEncoder();
+const KEY_RE = /^[a-zA-Z0-9-]+$/;
+
+const toHex = (u8) => [...u8].map(b => b.toString(16).padStart(2, '0')).join('');
+const fromHex = (hex) => new Uint8Array((hex.match(/.{1,2}/g) || []).map(h => parseInt(h, 16)));
+
+async function sha256Hex(input) {
+  const data = typeof input === 'string' ? te.encode(input) : input;
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  return toHex(new Uint8Array(digest));
 }
 
-async function hash(input) {
-  const msgUint8 = new TextEncoder().encode(input);
-  const hashBuffer = await crypto.subtle.digest('SHA-256', msgUint8);
-  return [...new Uint8Array(hashBuffer)].map(b => b.toString(16).padStart(2, '0')).join('');
+function randomHex(nBytes) {
+  const buf = new Uint8Array(nBytes);
+  crypto.getRandomValues(buf);
+  return toHex(buf);
 }
 
-async function checkRateLimit(ip, db) {
-    const key = `public:${ip}`;
-    const windowSeconds = 60;
-    const maxRequests = 10;
-    const now = Date.now();
-    const record = await db.prepare("SELECT timestamps FROM rate_limits WHERE key = ?").bind(key).first();
-    let timestamps = record ? JSON.parse(record.timestamps) : [];
-    const recentTimestamps = timestamps.filter(ts => (now - ts) < (windowSeconds * 1000));
-    if (recentTimestamps.length >= maxRequests) return false;
-    recentTimestamps.push(now);
-    const newTimestamps = JSON.stringify(recentTimestamps);
-    await db.prepare("INSERT INTO rate_limits (key, timestamps) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET timestamps = excluded.timestamps").bind(key, newTimestamps).run();
-    return true;
+async function hashPassword(password) {
+  const salt = new Uint8Array(16);
+  crypto.getRandomValues(salt);
+  const key = await crypto.subtle.importKey('raw', te.encode(password), { name: 'PBKDF2' }, false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt, iterations: PBKDF2_ITERATIONS, hash: 'SHA-256' }, key, 256);
+  const hashHex = toHex(new Uint8Array(bits));
+  return `pbkdf2:${PBKDF2_ITERATIONS}:${toHex(salt)}:${hashHex}`;
 }
 
-async function getLoginBlockedUntil(key, db) {
-    const record = await db.prepare("SELECT blocked_until FROM login_attempts WHERE key = ?").bind(key).first();
-    if (record && record.blocked_until && Date.now() < record.blocked_until) {
-        return record.blocked_until;
-    }
-    return null;
-}
-
-async function recordFailedLoginAttempt(key, db) {
-    const MAX_LOGIN_ATTEMPTS = 5;
-    const LOGIN_ATTEMPT_WINDOW_SECONDS = 600;
-
-    const record = await db.prepare("SELECT attempts, last_attempt_timestamp, block_count FROM login_attempts WHERE key = ?").bind(key).first();
-    const now = Date.now();
-    let attempts = 1;
-    let blockCount = 0;
-    let blockedUntil = null;
-    
-    if (record) {
-        blockCount = record.block_count;
-        if (now - record.last_attempt_timestamp > LOGIN_ATTEMPT_WINDOW_SECONDS * 1000) {
-            attempts = 1;
-        } else {
-            attempts = record.attempts + 1;
-        }
-    }
-    
-    if (attempts >= MAX_LOGIN_ATTEMPTS) {
-        const newBlockCount = blockCount + 1;
-        const blockDurationSeconds = Math.min(3600, (LOGIN_ATTEMPT_WINDOW_SECONDS * Math.pow(2, newBlockCount - 1)));
-        blockedUntil = now + (blockDurationSeconds * 1000);
-        blockCount = newBlockCount;
-    }
-
-    await db.prepare(
-        "INSERT INTO login_attempts (key, attempts, last_attempt_timestamp, blocked_until, block_count) VALUES (?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET attempts = excluded.attempts, last_attempt_timestamp = excluded.last_attempt_timestamp, blocked_until = excluded.blocked_until, block_count = excluded.block_count"
-    ).bind(key, attempts, now, blockedUntil, blockCount).run();
-}
-
-async function resetLoginAttempts(key, db) {
-    await db.prepare("DELETE FROM login_attempts WHERE key = ?").bind(key).run();
-}
-
-async function getFolderDepth(folderId, db) {
-    if (!folderId) return 0;
-    let depth = 0;
-    let currentId = folderId;
-    while (currentId && depth <= MAX_FOLDER_DEPTH + 1) {
-        depth++;
-        const parent = await db.prepare("SELECT parent_id FROM items WHERE id = ?").bind(currentId).first('parent_id');
-        currentId = parent;
-    }
-    return depth;
-}
-
-async function isDescendant(itemId, potentialParentId, db) {
-    let currentId = potentialParentId;
-    while (currentId) {
-        if (currentId === itemId) return true;
-        currentId = await db.prepare("SELECT parent_id FROM items WHERE id = ?").bind(currentId).first('parent_id');
-    }
+async function verifyPassword(password, stored) {
+  if (!stored || !password) return false;
+  const parts = stored.split(':');
+  if (parts[0] !== 'pbkdf2' || parts.length !== 4) {
     return false;
+  }
+  const iterations = parseInt(parts[1], 10);
+  const saltHex = parts[2];
+  const hashHex = parts[3];
+  const key = await crypto.subtle.importKey('raw', te.encode(password), { name: 'PBKDF2' }, false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt: fromHex(saltHex), iterations, hash: 'SHA-256' },
+    key,
+    256
+  );
+  const got = toHex(new Uint8Array(bits));
+  return timingSafeEqual(got, hashHex);
+}
+
+function timingSafeEqual(a, b) {
+  if (!a || !b) return false;
+  const ua = typeof a === 'string' ? te.encode(a) : a;
+  const ub = typeof b === 'string' ? te.encode(b) : b;
+  if (ua.length !== ub.length) return false;
+  let out = 0;
+  for (let i = 0; i < ua.length; i++) out |= ua[i] ^ ub[i];
+  return out === 0;
+}
+
+const allowed = ['https://short.yourdomain.com'];
+
+function makeHeaders(request, env) {
+  const origin = request.headers.get('Origin') || '';
+  const allowOrigin = allowed.includes(origin) ? origin : allowed[0];
+
+  const h = new Headers({
+    'Strict-Transport-Security': 'max-age=31536000; includeSubDomains; preload',
+    'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+    'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data:; connect-src 'self' https://short.yourdomain.com; frame-ancestors 'none'; object-src 'none'; base-uri 'none'; form-action 'self'",
+    'Referrer-Policy': 'no-referrer',
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'X-XSS-Protection': '0',
+    'Cross-Origin-Opener-Policy': 'same-origin',
+    'Cross-Origin-Resource-Policy': 'same-origin',
+    'Access-Control-Allow-Credentials': 'true',
+    'Access-Control-Allow-Origin': allowOrigin,
+    'Access-Control-Allow-Headers': 'Content-Type, X-CSRF-Token',
+    'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+  });
+  return h;
+}
+
+const noCache = {
+  'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0',
+  'Pragma': 'no-cache',
+  'Expires': '0',
+};
+
+function json(body, status = 200, headers = new Headers()) {
+  const h = new Headers(headers);
+  h.set('Content-Type', 'application/json');
+  for (const [k, v] of Object.entries(noCache)) h.set(k, v);
+  return new Response(JSON.stringify(body), { status, headers: h });
+}
+
+function styledMessageResponse(message, status = 200, headers = new Headers()) {
+  const h = new Headers(headers);
+  h.set('Content-Type', 'text/html; charset=utf-8');
+  for (const [k, v] of Object.entries(noCache)) h.set(k, v);
+  const html = `<!doctype html><meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>links</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif;display:grid;place-items:center;height:100vh;margin:0;background:#0b1220;color:#e6edf3}
+    .card{background:#0f172a;border:1px solid #1e293b;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.4);padding:24px;max-width:540px}
+    h1{font-weight:700;font-size:20px;margin:0 0 8px}
+    p{margin:0;color:#9fb0c0}
+  </style>
+  <main class="card"><h1>${status}</h1><p>${message}</p></main>`;
+  return new Response(html, { status, headers: h });
+}
+
+function parseCookies(request) {
+  const cookie = request.headers.get('Cookie');
+  if (!cookie) return {};
+  return Object.fromEntries(cookie.split(';').map(c => c.trim().split('=').map(decodeURIComponent)));
+}
+
+function setSessionCookie(h, token) {
+  const cookie = [
+    `session=${encodeURIComponent(token)}`,
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Lax',
+    'Secure',
+  ].join('; ');
+  h.append('Set-Cookie', cookie);
+}
+
+function clearSessionCookie(h) {
+  h.append('Set-Cookie', 'session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure');
+}
+
+async function getValidSession(DB, request) {
+  const cookies = parseCookies(request);
+  const token = cookies.session;
+  if (!token) return { valid: false, reason: 'no-session' };
+
+  const row = await DB.prepare(
+    `SELECT csrf_token, created_at, last_activity_at FROM sessions WHERE session_token = ?`
+  ).bind(token).first();
+
+  if (!row) return { valid: false, reason: 'not-found' };
+
+  const now = Date.now();
+  if (row.created_at + SESSION_TOKEN_TTL_SECONDS * 1000 < now) {
+    return { valid: false, reason: 'expired' };
+  }
+  if (row.last_activity_at + IDLE_SESSION_TIMEOUT_SECONDS * 1000 < now) {
+    return { valid: false, reason: 'idle' };
+  }
+
+  await DB.prepare(`UPDATE sessions SET last_activity_at = ? WHERE session_token = ?`).bind(now, token).run();
+  return { valid: true, csrf: row.csrf_token, token };
+}
+
+async function requireAuth(DB, request) {
+  const session = await getValidSession(DB, request);
+  if (!session.valid) return { ok: false, status: 401, body: { authenticated: false, reason: session.reason } };
+  return { ok: true, session };
+}
+
+async function requireCsrf(DB, request) {
+  const session = await getValidSession(DB, request);
+  if (!session.valid) return { ok: false, status: 401, body: { authenticated: false, reason: session.reason } };
+  const headerToken = request.headers.get('X-CSRF-Token');
+  if (!headerToken || !timingSafeEqual(headerToken, session.csrf)) {
+    return { ok: false, status: 403, body: { error: 'CSRF token invalid' } };
+  }
+  return { ok: true, session };
+}
+
+async function readJsonOrForm(request) {
+  const ct = request.headers.get('Content-Type') || '';
+  if (ct.includes('application/json')) {
+    try {
+      return await request.json();
+    } catch {
+      return {};
+    }
+  }
+  try {
+    const fd = await request.formData();
+    return Object.fromEntries(fd.entries());
+  } catch {
+    return {};
+  }
+}
+
+function normalizeKey(key) {
+  key = (key || '').trim();
+  if (!key) return '';
+  if (key.startsWith('/')) key = key.slice(1);
+  if (key.length > MAX_PATH_LENGTH) key = key.slice(0, MAX_PATH_LENGTH);
+  return key;
+}
+
+async function getFolderDepth(DB, folderId) {
+  let depth = 0;
+  let current = folderId;
+  while (current) {
+    const parent = await DB.prepare(`SELECT parent_id FROM items WHERE id = ? AND type = 'folder'`).bind(current).first('parent_id');
+    current = parent || null;
+    if (current) depth++;
+    if (depth > 32) break;
+  }
+  return depth;
+}
+
+async function isDescendant(DB, itemId, possibleAncestorId) {
+  let current = await DB.prepare(`SELECT parent_id FROM items WHERE id = ?`).bind(itemId).first('parent_id');
+  while (current) {
+    if (current === possibleAncestorId) return true;
+    current = await DB.prepare(`SELECT parent_id FROM items WHERE id = ?`).bind(current).first('parent_id');
+  }
+  return false;
+}
+
+async function deleteFolderRecursive(DB, id) {
+  const children = (await DB.prepare(`SELECT id, type FROM items WHERE parent_id = ?`).bind(id).all()).results || [];
+  for (const c of children) {
+    if (c.type === 'folder') await deleteFolderRecursive(DB, c.id);
+    else await DB.prepare(`DELETE FROM items WHERE id = ?`).bind(c.id).run();
+  }
+  await DB.prepare(`DELETE FROM items WHERE id = ?`).bind(id).run();
 }
 
 export default {
-    async fetch(request, env) {
-        const url = new URL(request.url);
-        const { pathname } = url;
-        const DB = env.DB;
-        const clientIp = request.headers.get('CF-Connecting-IP') || 'unknown';
+  async fetch(request, env) {
+    const { DB } = env;
+    const url = new URL(request.url);
+    const pathname = url.pathname;
+    const headers = makeHeaders(request, env);
 
-        const commonHeaders = {
-            'Access-Control-Allow-Origin': 'https://short.domain.com',
-            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, DELETE, PUT',
-            'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-CSRF-Token',
-            'Access-Control-Allow-Credentials': 'true',
-            'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY',
-            'Strict-Transport-Security': 'max-age=31536000; includeSubDomains'
-        };
-
-        const jsonResponse = (data, status = 200, additionalHeaders = {}) => new Response(JSON.stringify(data), {
-            status, headers: { 'Content-Type': 'application/json', ...commonHeaders, ...additionalHeaders }
-        });
-        
-        const styledMessageResponse = (message, status = 200) => new Response(`<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Notice</title><style>body{font-family: 'Inter',-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:#1e1e1e;color:#f5f5f5;margin:0;display:flex;justify-content:center;align-items:center;text-align:center;min-height:100vh;padding:1rem;box-sizing:border-box;}.message-container{max-width:600px}</style></head><body><div class="message-container"><h2>${message}</h2></div></body></html>`, {
-            status, headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate', 'Referrer-Policy': 'no-referrer', ...commonHeaders }
-        });
-        
-        if (request.method === 'OPTIONS') {
-            return new Response(null, { headers: { ...commonHeaders, 'Access-Control-Max-Age': '86400' } });
-        }
-
-        if (pathname.startsWith('/api/')) {
-            return handleApiRequest(request, env);
-        }
-
-        const isAllowed = await checkRateLimit(clientIp, DB);
-        if (!isAllowed) {
-            return styledMessageResponse('You are making too many requests. Please try again in a moment.', 429);
-        }
-
-        const key = pathname.slice(1);
-        const item = await DB.prepare("SELECT * FROM items WHERE id = ? AND type = 'link'").bind(key).first();
-
-        if (!item) return styledMessageResponse('Resource not found.', 404);
-
-        const now = Date.now();
-        const noCacheHeaders = { 'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate', 'Referrer-Policy': 'no-referrer' };
-
-        if (item.expires_at && item.expires_at < now) return styledMessageResponse('This link has expired.', 410);
-        if (item.max_clicks > 0 && item.clicks >= item.max_clicks) return styledMessageResponse('This link has reached its maximum click limit.', 410);
-
-        if (!item.password_hash) {
-            await DB.prepare("UPDATE items SET clicks = clicks + 1 WHERE id = ?").bind(key).run();
-            return new Response(null, { status: 302, headers: { ...noCacheHeaders, 'Location': item.original_url } });
-        }
-
-        if (request.method === 'GET') {
-            const redirectUrl = `https://short.domain.com/password_protected.html?key=${key}`;
-            return Response.redirect(redirectUrl, 302);
-        }
-
-        if (request.method === 'POST') {
-            const form = await request.formData();
-            const password = form.get('password');
-            if (await timingSafeEqual(await hash(password), item.password_hash)) {
-                await DB.prepare("UPDATE items SET clicks = clicks + 1 WHERE id = ?").bind(key).run();
-                return jsonResponse({ success: true, redirectUrl: item.original_url });
-            }
-            return jsonResponse({ error: 'Authentication failed.' }, 403);
-        }
-
-        return jsonResponse({ error: 'Method not allowed.' }, 405);
-
-
-        async function handleApiRequest(request, env) {
-            const url = new URL(request.url);
-            const { pathname } = url;
-            const DB = env.DB;
-            const clientIp = request.headers.get('CF-Connecting-IP') || 'unknown';
-
-            const isAuthenticated = async (currentClientIp) => {
-                const cookieHeader = request.headers.get("Cookie");
-                if (!cookieHeader) return { valid: false, reason: 'no_token', token: null, sessionIp: null };
-                const cookieMatch = cookieHeader.match(/auth_token=([^;]+)/);
-                if (!cookieMatch) return { valid: false, reason: 'no_token', token: null, sessionIp: null };
-                const token = cookieMatch[1];
-                
-                const session = await DB.prepare("SELECT session_token, last_activity_at, expires_at, ip_address FROM sessions WHERE session_token = ? AND expires_at > ?").bind(token, Date.now()).first();
-                
-                if (!session) return { valid: false, reason: 'invalid_token', token: null, sessionIp: null };
-
-                const now = Date.now();
-
-                if (now - session.last_activity_at > IDLE_SESSION_TIMEOUT_SECONDS * 1000) {
-                    await DB.prepare("DELETE FROM sessions WHERE session_token = ?").bind(token).run();
-                    await DB.prepare("DELETE FROM admin_session WHERE id = 1").run();
-                    return { valid: false, reason: 'idle_timeout', token: null, sessionIp: null };
-                }
-                
-                await DB.prepare("UPDATE sessions SET last_activity_at = ? WHERE session_token = ?").bind(now, token).run();
-
-                return { valid: true, token, sessionIp: session.ip_address };
-            };
-
-            const isCsrfTokenValid = async (authResult) => {
-                if (!authResult.valid) return false;
-                const headerToken = request.headers.get('X-CSRF-Token');
-                if (!headerToken) return false;
-                const session = await DB.prepare("SELECT csrf_token_hash FROM sessions WHERE session_token = ?").bind(authResult.token).first();
-                if (!session) return false;
-                return await timingSafeEqual(await hash(headerToken), session.csrf_token_hash);
-            };
-
-            if (pathname === '/api/check-auth') {
-                const authResult = await isAuthenticated(clientIp);
-                return jsonResponse({ authenticated: authResult.valid }, authResult.valid ? 200 : 401);
-            }
-
-            if (pathname === '/api/login') {
-                const ipKey = `ip:${clientIp}`;
-                const ipBlockedUntil = await getLoginBlockedUntil(ipKey, DB);
-                if (ipBlockedUntil) return jsonResponse({ error: 'Too many failed login attempts. Please try again later.' }, 429);
-                
-                const form = await request.formData();
-                const username = form.get('username');
-                const password = form.get('password');
-                const usernameKey = `username:${username}`;
-
-                const usernameBlockedUntil = await getLoginBlockedUntil(usernameKey, DB);
-                if (usernameBlockedUntil) {
-                     await recordFailedLoginAttempt(ipKey, DB);
-                     return jsonResponse({ error: 'Authentication failed for this user.' }, 403);
-                }
-
-                const isUsernameValid = await timingSafeEqual(await hash(username), env.ADMIN_USERNAME_HASH);
-                const isPasswordValid = await timingSafeEqual(await hash(password), env.ADMIN_PASSWORD_HASH);
-    
-                if (isUsernameValid && isPasswordValid) {
-                    await Promise.all([resetLoginAttempts(ipKey, DB), resetLoginAttempts(usernameKey, DB)]);
-
-                    const oldAdminSession = await DB.prepare("SELECT session_token FROM admin_session WHERE id = 1").first();
-                    if(oldAdminSession) {
-                        await DB.prepare("DELETE FROM sessions WHERE session_token = ?").bind(oldAdminSession.session_token).run();
-                    }
-
-                    const newSessionToken = crypto.randomUUID();
-                    const newCsrfToken = crypto.randomUUID();
-                    const csrfTokenHash = await hash(newCsrfToken);
-                    const now = Date.now();
-                    const expiresAt = now + (SESSION_TOKEN_TTL_SECONDS * 1000);
-
-                    await DB.batch([
-                        DB.prepare("INSERT INTO sessions (session_token, csrf_token_hash, created_at, expires_at, last_activity_at, ip_address) VALUES (?, ?, ?, ?, ?, ?)").bind(newSessionToken, csrfTokenHash, now, expiresAt, now, clientIp),
-                        DB.prepare("INSERT INTO admin_session (id, session_token) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET session_token = excluded.session_token").bind(newSessionToken)
-                    ]);
-    
-                    const sessionCookie = `auth_token=${newSessionToken}; Path=/; HttpOnly; SameSite=None; Secure; Max-Age=${SESSION_TOKEN_TTL_SECONDS}`;
-                    const response = jsonResponse({ success: true, csrfToken: newCsrfToken });
-                    response.headers.append('Set-Cookie', sessionCookie);
-                    return response;
-                } else {
-                    await Promise.all([recordFailedLoginAttempt(ipKey, DB), recordFailedLoginAttempt(usernameKey, DB)]);
-                    return jsonResponse({ error: 'Invalid username or password.' }, 403);
-                }
-            }
-
-            const authResult = await isAuthenticated(clientIp);
-            if (!authResult.valid) return jsonResponse({ error: 'Authentication required.', reason: authResult.reason }, 401);
-
-            if (authResult.sessionIp && authResult.sessionIp !== clientIp) {
-                await DB.prepare("DELETE FROM sessions WHERE session_token = ?").bind(authResult.token).run();
-                await DB.prepare("DELETE FROM admin_session WHERE id = 1").run();
-                return jsonResponse({ error: 'Session IP mismatch. Please log in again.' }, 401);
-            }
-
-            if (pathname === '/api/logout') {
-                await DB.batch([
-                    DB.prepare("DELETE FROM sessions WHERE session_token = ?").bind(authResult.token),
-                    DB.prepare("DELETE FROM admin_session WHERE id = 1")
-                ]);
-                const response = jsonResponse({ success: true });
-                response.headers.append('Set-Cookie', 'auth_token=; Path=/; HttpOnly; SameSite=None; Secure; Max-Age=0');
-                return response;
-            }
-            
-            if (pathname === '/api/session-info') {
-                const newCsrfToken = crypto.randomUUID();
-                await DB.prepare("UPDATE sessions SET csrf_token_hash = ? WHERE session_token = ?").bind(await hash(newCsrfToken), authResult.token).run();
-                return jsonResponse({ csrfToken: newCsrfToken });
-            }
-
-            if (!await isCsrfTokenValid(authResult)) return jsonResponse({ error: 'Invalid security token.' }, 403);
-
-            if (pathname === '/api/admin') {
-                let query = "SELECT * FROM items";
-                let countQuery = "SELECT count(*) as total FROM items";
-                let whereClauses = [];
-                let bindings = [];
-
-                const parentFolderId = url.searchParams.get('folderId');
-                if (parentFolderId === 'null') {
-                    whereClauses.push("parent_id IS NULL");
-                } else if (parentFolderId) {
-                    whereClauses.push("parent_id = ?");
-                    bindings.push(parentFolderId);
-                }
-
-                const searchQuery = url.searchParams.get('search')?.toLowerCase();
-                if (searchQuery) {
-                    whereClauses.push("( (type = 'folder' AND name LIKE ?) OR (type = 'link' AND (id LIKE ? OR original_url LIKE ?)) )");
-                    const searchTerm = `%${searchQuery}%`;
-                    bindings.push(searchTerm, searchTerm, searchTerm);
-                }
-
-                const minClicks = parseInt(url.searchParams.get('minClicks'), 10);
-                if (!isNaN(minClicks)) {
-                    whereClauses.push("clicks >= ?");
-                    bindings.push(minClicks);
-                }
-                const maxClicks = parseInt(url.searchParams.get('maxClicks'), 10);
-                if (!isNaN(maxClicks)) {
-                    whereClauses.push("clicks <= ?");
-                    bindings.push(maxClicks);
-                }
-
-                const expiryStatus = url.searchParams.get('expiryStatus');
-                if (expiryStatus && expiryStatus !== 'all') {
-                    const now = Date.now();
-                    if (expiryStatus === 'never') {
-                        whereClauses.push("expires_at IS NULL");
-                    } else if (expiryStatus === 'expired') {
-                        whereClauses.push("expires_at IS NOT NULL AND expires_at < ?");
-                        bindings.push(now);
-                    } else if (expiryStatus === 'expiresSoon') {
-                        whereClauses.push("expires_at BETWEEN ? AND ?");
-                        bindings.push(now, now + 86400000);
-                    }
-                }
-
-                const creationDateFrom = parseInt(url.searchParams.get('creationDateFrom'), 10);
-                if (!isNaN(creationDateFrom)) {
-                    whereClauses.push("created_at >= ?");
-                    bindings.push(creationDateFrom);
-                }
-                const creationDateTo = parseInt(url.searchParams.get('creationDateTo'), 10);
-                if (!isNaN(creationDateTo)) {
-                    whereClauses.push("created_at <= ?");
-                    bindings.push(creationDateTo);
-                }
-
-                if (whereClauses.length > 0) {
-                    const finalWhere = `WHERE ${whereClauses.join(' AND ')}`;
-                    query += ` ${finalWhere}`;
-                    countQuery += ` ${finalWhere}`;
-                }
-
-                let sortBy = url.searchParams.get('sortBy') || 'created_at';
-                let sortOrder = url.searchParams.get('sortOrder') || 'DESC';
-                const allowedSortBy = ['created_at', 'clicks', 'id'];
-                if (!allowedSortBy.includes(sortBy)) {
-                    sortBy = 'created_at';
-                }
-                if (sortOrder.toUpperCase() !== 'ASC' && sortOrder.toUpperCase() !== 'DESC') {
-                    sortOrder = 'DESC';
-                }
-                
-                const page = parseInt(url.searchParams.get("page") || "1");
-                const itemsPerPage = 10;
-                query += ` ORDER BY type ASC, ${sortBy} ${sortOrder} LIMIT ? OFFSET ?`;
-                
-                const itemsPromise = DB.prepare(query).bind(...bindings, itemsPerPage, (page - 1) * itemsPerPage).all();
-                const totalPromise = DB.prepare(countQuery).bind(...bindings).first('total');
-                
-                const [{ results }, totalItems] = await Promise.all([itemsPromise, totalPromise]);
-
-                const formattedItems = results.map(item => ({
-                    id: item.id, key: item.id, is_folder: item.type === 'folder', name: item.name,
-                    fullShortUrl: item.type === 'link' ? new URL(item.id, 'https://links.domain.com').toString() : null,
-                    originalUrl: item.original_url, hasPassword: !!item.password_hash, clicks: item.clicks,
-                    maxClicks: item.max_clicks, expirationTimestamp: item.expires_at, created: item.created_at
-                }));
-                return jsonResponse({ items: formattedItems, page, totalPages: Math.ceil(totalItems / itemsPerPage) });
-            }
-
-            if (pathname === '/api/create-folder') {
-                const { folderName, parentFolderId } = await request.json();
-                if (typeof folderName !== 'string' || !folderName.trim() || folderName.length > 100 || !/^[a-zA-Z0-9\s\-_.,()]+$/.test(folderName)) {
-                    return jsonResponse({ error: 'Invalid folder name.' }, 400);
-                }
-
-                const parentId = parentFolderId === 'null' ? null : parentFolderId;
-                const depth = await getFolderDepth(parentId, DB);
-                if (depth >= MAX_FOLDER_DEPTH) return jsonResponse({ error: `Maximum folder depth of ${MAX_FOLDER_DEPTH} reached.` }, 400);
-
-                const { count } = await DB.prepare("SELECT count(*) as count FROM items WHERE parent_id " + (parentId ? "= ?" : "IS NULL")).bind(...(parentId ? [parentId] : [])).first();
-                if (count >= MAX_ITEMS_PER_FOLDER) return jsonResponse({ error: `A folder cannot contain more than ${MAX_ITEMS_PER_FOLDER} items.` }, 400);
-
-                const id = crypto.randomUUID();
-                await DB.prepare("INSERT INTO items (id, type, name, created_at, parent_id) VALUES (?, 'folder', ?, ?, ?)").bind(id, folderName, Date.now(), parentId).run();
-                return jsonResponse({ success: true, id });
-            }
-            
-            if (pathname === '/api/rename-folder') {
-                const { folderId, newName } = await request.json();
-                if (!folderId || typeof newName !== 'string' || !newName.trim() || newName.length > 100 || !/^[a-zA-Z0-9\s\-_.,()]+$/.test(newName)) {
-                    return jsonResponse({ error: 'Invalid folder name provided.' }, 400);
-                }
-                await DB.prepare("UPDATE items SET name = ? WHERE id = ? AND type = 'folder'").bind(newName.trim(), folderId).run();
-                return jsonResponse({ success: true });
-            }
-
-            if (pathname === '/api/shorten') {
-                const form = await request.formData();
-                const longUrl = form.get('longUrl');
-                const shortPath = form.get('shortPath');
-                if (typeof longUrl !== 'string' || typeof shortPath !== 'string' || !longUrl.trim() || !shortPath.trim() || shortPath.length > MAX_PATH_LENGTH) return jsonResponse({ error: 'Invalid input.' }, 400);
-
-                const existing = await DB.prepare("SELECT id FROM items WHERE id = ?").bind(shortPath).first();
-                if (existing) return jsonResponse({ error: 'Path already exists.' }, 409);
-                
-                const parentFolderId = form.get('parentFolderId') === 'null' ? null : form.get('parentFolderId');
-                const { count } = await DB.prepare("SELECT count(*) as count FROM items WHERE parent_id " + (parentFolderId ? "= ?" : "IS NULL")).bind(...(parentFolderId ? [parentFolderId] : [])).first();
-                if (count >= MAX_ITEMS_PER_FOLDER) return jsonResponse({ error: `A folder cannot contain more than ${MAX_ITEMS_PER_FOLDER} items.` }, 400);
-
-                const password = form.get('password');
-                await DB.prepare("INSERT INTO items (id, type, original_url, password_hash, max_clicks, expires_at, created_at, parent_id) VALUES (?, 'link', ?, ?, ?, ?, ?, ?)")
-                   .bind(shortPath, longUrl, password ? await hash(password) : null, parseInt(form.get('maxClicks'), 10) || 0, parseInt(form.get('expiresAtTimestamp'), 10) || null, Date.now(), parentFolderId)
-                   .run();
-                return jsonResponse({ success: true, shortUrl: new URL(shortPath, 'https://links.domain.com').toString() });
-            }
-            
-            if (pathname === '/api/delete') {
-                const { ids } = await request.json();
-                if (!Array.isArray(ids)) return jsonResponse({ error: 'Invalid request' }, 400);
-                const placeholders = ids.map(() => '?').join(',');
-                await DB.prepare(`DELETE FROM items WHERE id IN (${placeholders})`).bind(...ids).run();
-                return jsonResponse({ success: true, deletedCount: ids.length });
-            }
-            
-            if (pathname === '/api/move') {
-                const { ids, destinationFolderId } = await request.json();
-                if (!Array.isArray(ids)) return jsonResponse({ error: 'Invalid request' }, 400);
-                const destId = destinationFolderId === 'null' ? null : destinationFolderId;
-                for (const id of ids) {
-                    if (id === destId || await isDescendant(id, destId, DB)) {
-                        return jsonResponse({ error: 'Cannot move a folder into itself or one of its children.' }, 400);
-                    }
-                }
-                const placeholders = ids.map(() => '?').join(',');
-                await DB.prepare(`UPDATE items SET parent_id = ? WHERE id IN (${placeholders})`).bind(destId, ...ids).run();
-                return jsonResponse({ success: true });
-            }
-
-            if (pathname === '/api/folder-tree') {
-                const { results } = await DB.prepare("SELECT id, name, parent_id FROM items WHERE type = 'folder'").all();
-                return jsonResponse(results.map(r => ({ id: r.id, name: r.name, parent_folder_id: r.parent_id })));
-            }
-            
-            if (pathname.startsWith('/api/edit/')) {
-                const item = await DB.prepare("SELECT original_url, expires_at, max_clicks, password_hash FROM items WHERE id = ?").bind(pathname.split('/').pop()).first();
-                if (!item) return jsonResponse({ error: 'Resource not found' }, 404);
-                return jsonResponse({ url: item.original_url, expiresAt: item.expires_at, maxClicks: item.max_clicks, hasPassword: !!item.password_hash });
-            }
-
-            if (pathname === '/api/edit') {
-                 const form = await request.formData();
-                 const originalKey = form.get('originalKey');
-                 const newKey = form.get('newKey');
-                 if (originalKey !== newKey) {
-                     const existing = await DB.prepare("SELECT id FROM items WHERE id = ?").bind(newKey).first();
-                     if (existing) return jsonResponse({ error: 'New path is already in use.' }, 409);
-                 }
-
-                 let passwordHash = undefined;
-                 if (form.has('password')) {
-                     const password = form.get('password');
-                     passwordHash = password ? await hash(password) : "";
-                 }
-
-                 let bindings = [form.get('longUrl'), parseInt(form.get('expiresAtTimestamp'), 10) || null, parseInt(form.get('maxClicks'), 10) || 0];
-                 let query = "UPDATE items SET original_url = ?, expires_at = ?, max_clicks = ?";
-                 if(passwordHash !== undefined) {
-                     query += ", password_hash = ?";
-                     bindings.push(passwordHash);
-                 }
-                 if (originalKey !== newKey) {
-                    query += ", id = ?";
-                    bindings.push(newKey);
-                 }
-                 query += " WHERE id = ?";
-                 bindings.push(originalKey);
-                 
-                 await DB.prepare(query).bind(...bindings).run();
-
-                 if (originalKey !== newKey) {
-                    await DB.prepare("UPDATE items SET parent_id = ? WHERE parent_id = ?").bind(newKey, originalKey).run();
-                 }
-                 return jsonResponse({ success: true });
-            }
-
-            return jsonResponse({ error: 'API endpoint not found.' }, 404);
-        }
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers });
     }
+
+    if (pathname === '/api/check-auth' && request.method === 'GET') {
+      const auth = await requireAuth(DB, request);
+      if (!auth.ok) return json(auth.body, 401, headers);
+      return json({ authenticated: true }, 200, headers);
+    }
+
+    if (pathname === '/api/session-info' && request.method === 'GET') {
+      const session = await getValidSession(DB, request);
+      if (!session.valid) return json({ authenticated: false, reason: session.reason }, 401, headers);
+      return json({ authenticated: true, csrfToken: session.csrf }, 200, headers);
+    }
+
+    if (pathname === '/api/login' && request.method === 'POST') {
+      const body = await readJsonOrForm(request);
+      const username = (body.username || '').trim();
+      const password = body.password || '';
+
+      const ip = request.headers.get('CF-Connecting-IP') || '0.0.0.0';
+      const rlKey = `login:${ip}`;
+      const now = Date.now();
+
+      let attempts = 0, blockedUntil = 0, blockCount = 0;
+      try {
+        const rec = await DB.prepare(`SELECT attempts, blocked_until, block_count FROM login_attempts WHERE key = ?`).bind(rlKey).first();
+        attempts = rec?.attempts || 0;
+        blockedUntil = rec?.blocked_until || 0;
+        blockCount = rec?.block_count || 0;
+        if (blockedUntil && now < blockedUntil) {
+          return styledMessageResponse('Too many attempts. Try again shortly.', 429, headers);
+        }
+      } catch (e) {}
+
+      let ok = false;
+      try {
+        ok = await verifyPassword(password, env.ADMIN_PASS_PBKDF2) && (!env.ADMIN_USER_HASH || (await sha256Hex(username)) === env.ADMIN_USER_HASH);
+      } catch { 
+        ok = false; 
+      }
+
+      if (!ok) {
+        try {
+          attempts += 1;
+          if (attempts % 5 === 0) {
+            blockCount += 1;
+            blockedUntil = now + Math.min(60_000 * blockCount, 10 * 60_000);
+          }
+          await DB.prepare(`INSERT INTO login_attempts (key, attempts, last_attempt_at, blocked_until, block_count) VALUES (?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET attempts=excluded.attempts, last_attempt_at=excluded.last_attempt_at, blocked_until=excluded.blocked_until, block_count=excluded.block_count`).bind(rlKey, attempts, now, blockedUntil, blockCount).run();
+        } catch {}
+        return json({ error: 'Invalid credentials' }, 401, headers);
+      }
+
+      const sessionToken = randomHex(32);
+      const csrfToken = randomHex(32);
+      await DB.prepare(`INSERT INTO sessions (session_token, csrf_token, created_at, last_activity_at) VALUES (?, ?, ?, ?)`).bind(sessionToken, csrfToken, now, now).run();
+
+      const h = new Headers(headers);
+      setSessionCookie(h, sessionToken);
+      return json({ success: true, csrfToken }, 200, h);
+    }
+
+    if (pathname === '/api/logout' && request.method === 'POST') {
+      const csrf = await requireCsrf(DB, request);
+      if (!csrf.ok) return json(csrf.body, csrf.status, headers);
+      await DB.prepare(`DELETE FROM sessions WHERE session_token = ?`).bind(csrf.session.token).run();
+      const h = new Headers(headers); clearSessionCookie(h);
+      return new Response('', { status: 204, headers: h });
+    }
+
+
+    if (pathname === '/api/admin' && request.method === 'GET') {
+      const auth = await requireAuth(DB, request);
+      if (!auth.ok) return json(auth.body, 401, headers);
+
+      const params = url.searchParams;
+      const base = `${url.origin}/`;
+      
+      const page = parseInt(params.get('page') || '1', 10);
+      const folderId = params.get('folderId');
+      const searchQuery = params.get('search');
+      const sortBy = params.get('sortBy') || 'default';
+      const sortOrder = params.get('sortOrder') === 'ASC' ? 'ASC' : 'DESC';
+
+      const minClicks = parseInt(params.get('minClicks'), 10);
+      const maxClicks = parseInt(params.get('maxClicks'), 10);
+      const expiryStatus = params.get('expiryStatus');
+      const creationDateFrom = parseInt(params.get('creationDateFrom'), 10);
+      const creationDateTo = parseInt(params.get('creationDateTo'), 10);
+
+      let whereClauses = [];
+      let bindings = [];
+
+      if (folderId && folderId !== 'null') {
+          whereClauses.push('parent_id = ?');
+          bindings.push(folderId);
+      } else {
+          whereClauses.push('parent_id IS NULL');
+      }
+
+      if (searchQuery) {
+        whereClauses.push(`(id LIKE ? OR name LIKE ? OR original_url LIKE ?)`);
+        bindings.push(`%${searchQuery}%`, `%${searchQuery}%`, `%${searchQuery}%`);
+      }
+
+      if (!isNaN(minClicks) && minClicks >= 0) {
+          whereClauses.push('clicks >= ?');
+          bindings.push(minClicks);
+      }
+      if (!isNaN(maxClicks) && maxClicks >= 0) {
+          whereClauses.push('clicks <= ?');
+          bindings.push(maxClicks);
+      }
+      if (!isNaN(creationDateFrom)) {
+          whereClauses.push('created_at >= ?');
+          bindings.push(creationDateFrom);
+      }
+      if (!isNaN(creationDateTo)) {
+          whereClauses.push('created_at <= ?');
+          bindings.push(creationDateTo);
+      }
+
+      const now = Date.now();
+      switch (expiryStatus) {
+          case 'never':
+              whereClauses.push('(expires_at IS NULL OR expires_at = 0)');
+              break;
+          case 'expired':
+              whereClauses.push(`( (expires_at IS NOT NULL AND expires_at < ?) OR (max_clicks IS NOT NULL AND clicks >= max_clicks) )`);
+              bindings.push(now);
+              break;
+          case 'expiresSoon':
+              const in24Hours = now + 24 * 60 * 60 * 1000;
+              whereClauses.push(`( expires_at IS NOT NULL AND expires_at > ? AND expires_at < ? )`);
+              bindings.push(now, in24Hours);
+              break;
+      }
+
+      const whereString = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
+
+      let orderByString = `ORDER BY
+          CASE WHEN type = 'folder' THEN 0 ELSE 1 END ASC,
+          CASE WHEN type = 'folder' THEN name END ASC`;
+
+      const validSortColumnsForLinks = ['created_at', 'clicks', 'id'];
+      if (validSortColumnsForLinks.includes(sortBy)) {
+          orderByString += `, CASE WHEN type = 'link' THEN ${sortBy} END ${sortOrder}`;
+      } else {
+          orderByString += `, CASE WHEN type = 'link' THEN created_at END DESC`;
+      }
+
+      const offset = (page - 1) * ITEMS_PER_PAGE;
+      const sql = `SELECT id, type, name, original_url, password_hash, max_clicks, clicks, expires_at, created_at, parent_id FROM items ${whereString} ${orderByString} LIMIT ? OFFSET ?`;
+      const finalBindings = [...bindings, ITEMS_PER_PAGE, offset];
+      
+      const rows = (await DB.prepare(sql).bind(...finalBindings).all()).results || [];
+
+      const countSql = `SELECT COUNT(*) as count FROM items ${whereString}`;
+      const totalItems = (await DB.prepare(countSql).bind(...bindings).first()).count;
+      const totalPages = Math.ceil(totalItems / ITEMS_PER_PAGE);
+
+      const items = rows.map(r => {
+        if (r.type === 'folder') {
+          return { id: r.id, is_folder: true, name: r.name, parent_folder_id: r.parent_id || null, created: r.created_at };
+        }
+        return { id: r.id, key: r.id, is_folder: false, originalUrl: r.original_url, clicks: r.clicks || 0, maxClicks: r.max_clicks || 0, expirationTimestamp: r.expires_at || null, created: r.created_at, hasPassword: !!r.password_hash, fullShortUrl: new URL(r.id, base).toString() };
+      });
+
+      return json({ items, totalPages }, 200, headers);
+    }
+
+    if (pathname === '/api/create-folder' && request.method === 'POST') {
+      const csrf = await requireCsrf(DB, request);
+      if (!csrf.ok) return json(csrf.body, csrf.status, headers);
+      const body = await readJsonOrForm(request);
+      const name = (body.name || body.folderName || '').trim();
+      let parentFolderId = body.parentFolderId ?? body.targetFolderId ?? null;
+      if (parentFolderId === 'null' || parentFolderId === '') parentFolderId = null;
+
+      if (!name) return json({ error: 'Folder name required' }, 400, headers);
+      if (parentFolderId) {
+        if (await getFolderDepth(DB, parentFolderId) >= 32) return json({ error: 'Folder depth limit reached' }, 400, headers);
+      }
+      const id = `fld_${randomHex(8)}`;
+      const now = Date.now();
+      await DB.prepare(`INSERT INTO items (id, type, name, created_at, parent_id) VALUES (?, 'folder', ?, ?, ?)`).bind(id, name, now, parentFolderId).run();
+      return json({ success: true, id, name, parent_folder_id: parentFolderId }, 200, headers);
+    }
+
+    if (pathname === '/api/rename-folder' && request.method === 'POST') {
+      const csrf = await requireCsrf(DB, request);
+      if (!csrf.ok) return json(csrf.body, csrf.status, headers);
+      const body = await readJsonOrForm(request);
+      const id = body.id || body.folderId;
+      const name = (body.name || body.newName || '').trim();
+      if (!id || !name) return json({ error: 'id and name required' }, 400, headers);
+      if (!(await DB.prepare(`SELECT id FROM items WHERE id = ? AND type = 'folder'`).bind(id).first('id'))) return json({ error: 'Folder not found' }, 404, headers);
+      await DB.prepare(`UPDATE items SET name = ? WHERE id = ?`).bind(name, id).run();
+      return json({ success: true }, 200, headers);
+    }
+
+    if (pathname === '/api/move' && request.method === 'POST') {
+      const csrf = await requireCsrf(DB, request);
+      if (!csrf.ok) return json(csrf.body, csrf.status, headers);
+      const body = await readJsonOrForm(request);
+      let targetFolderId = body.targetFolderId ?? body.destinationFolderId ?? null;
+      if (targetFolderId === 'null' || targetFolderId === '') targetFolderId = null;
+      let ids = body.ids;
+      if (!Array.isArray(ids)) ids = ids ? [ids] : [];
+      if (!ids.length) return json({ error: 'No items provided' }, 400, headers);
+
+      if (targetFolderId) {
+        if (!(await DB.prepare(`SELECT id FROM items WHERE id = ? AND type = 'folder'`).bind(targetFolderId).first('id'))) return json({ error: 'Target folder not found' }, 404, headers);
+      }
+
+      for (const id of ids) {
+        const type = await DB.prepare(`SELECT type FROM items WHERE id = ?`).bind(id).first('type');
+        if (!type) continue;
+        
+        if (id === targetFolderId) {
+            return json({ error: 'Cannot move an item into itself.' }, 400, headers);
+        }
+
+        if (type === 'folder' && targetFolderId) {
+          if (await isDescendant(DB, targetFolderId, id)) return json({ error: 'Cannot move a folder into its own descendant' }, 400, headers);
+        }
+        await DB.prepare(`UPDATE items SET parent_id = ? WHERE id = ?`).bind(targetFolderId, id).run();
+      }
+      return json({ success: true }, 200, headers);
+    }
+
+    if (pathname === '/api/delete' && request.method === 'POST') {
+      const csrf = await requireCsrf(DB, request);
+      if (!csrf.ok) return json(csrf.body, csrf.status, headers);
+      const body = await readJsonOrForm(request);
+      let ids = body.ids;
+      if (!Array.isArray(ids)) ids = ids ? [ids] : [];
+      if (!ids.length) return json({ error: 'No items provided' }, 400, headers);
+      for (const id of ids) {
+        const row = await DB.prepare(`SELECT id, type FROM items WHERE id = ?`).bind(id).first();
+        if (!row) continue;
+        if (row.type === 'folder') await deleteFolderRecursive(DB, id);
+        else await DB.prepare(`DELETE FROM items WHERE id = ?`).bind(id).run();
+      }
+      return json({ success: true }, 200, headers);
+    }
+
+    if (pathname === '/api/folder-tree' && request.method === 'GET') {
+      const auth = await requireAuth(DB, request);
+      if (!auth.ok) return json(auth.body, 401, headers);
+      const rows = (await DB.prepare(`SELECT id, name, parent_id FROM items WHERE type = 'folder'`).all()).results || [];
+      return json(rows.map(r => ({ id: r.id, name: r.name, parent_folder_id: r.parent_id || null })), 200, headers);
+    }
+
+    if (pathname === '/api/shorten' && request.method === 'POST') {
+      const csrf = await requireCsrf(DB, request);
+      if (!csrf.ok) return json(csrf.body, csrf.status, headers);
+
+      const body = await readJsonOrForm(request);
+      const urlStr = (body.longUrl || body.url || body.originalUrl || '').trim();
+      if (!urlStr) return json({ error: 'URL required' }, 400, headers);
+      
+      let urlObj;
+      try {
+        urlObj = new URL(urlStr);
+      } catch {
+        return json({ error: 'Invalid URL format' }, 400, headers);
+      }
+      if (!['http:', 'https:'].includes(urlObj.protocol)) {
+        return json({ error: 'Only http and https URLs are allowed' }, 400, headers);
+      }
+
+      let parentFolderId = body.parentFolderId ?? null;
+      if (parentFolderId === 'null' || parentFolderId === '') {
+        parentFolderId = null;
+      }
+
+      if (parentFolderId) {
+        const exists = await DB.prepare(`SELECT id FROM items WHERE id = ? AND type = 'folder'`).bind(parentFolderId).first('id');
+        if (!exists) return json({ error: 'Parent folder not found' }, 404, headers);
+      }
+
+      let key = normalizeKey(body.customKey || body.key || body.shortPath || '');
+      if (!key) {
+          key = randomHex(4);
+      } else if (!KEY_RE.test(key)) {
+          return json({ error: 'Invalid short path format. Use only letters, numbers, and hyphens.' }, 400, headers);
+      }
+      
+      const existing = await DB.prepare(`SELECT id FROM items WHERE id = ?`).bind(key).first('id');
+      if (existing) return json({ error: 'Key already exists' }, 409, headers);
+
+      const now = Date.now();
+      let passwordHash = null;
+      if (body.password) {
+        passwordHash = await hashPassword(body.password);
+      }
+
+      const maxClicks = body.maxClicks ? parseInt(body.maxClicks, 10) : null;
+      const expiresAt = body.expiresAt ? parseInt(body.expiresAt, 10) : null;
+
+      await DB.prepare(`INSERT INTO items (id, type, original_url, password_hash, max_clicks, clicks, expires_at, created_at, parent_id) VALUES (?, 'link', ?, ?, ?, 0, ?, ?, ?)`).bind(key, urlStr, passwordHash, maxClicks, expiresAt, now, parentFolderId).run();
+
+      const fullShortUrl = new URL(key, `${url.origin}/`).toString();
+      return json({ success: true, id: key, fullShortUrl }, 200, headers);
+    }
+
+    if (pathname === '/api/edit' && request.method === 'POST') {
+      const csrf = await requireCsrf(DB, request);
+      if (!csrf.ok) return json(csrf.body, csrf.status, headers);
+      
+      const body = await readJsonOrForm(request);
+      const key = normalizeKey(body.key || body.id || '');
+      if (!key) return json({ error: 'key required' }, 400, headers);
+      
+      const item = await DB.prepare(`SELECT id FROM items WHERE id = ? AND type = 'link'`).bind(key).first('id');
+      if (!item) return json({ error: 'Link not found' }, 404, headers);
+
+      const updates = [];
+      const binds = [];
+
+      const newKey = normalizeKey(body.newKey || body.shortPath || '');
+      if (newKey && newKey !== key) {
+          if (!KEY_RE.test(newKey)) {
+              return json({ error: 'Invalid new short path format. Use only letters, numbers, and hyphens.' }, 400, headers);
+          }
+          const existing = await DB.prepare(`SELECT id FROM items WHERE id = ?`).bind(newKey).first('id');
+          if (existing) {
+              return json({ error: 'The new short path is already in use.' }, 409, headers);
+          }
+          updates.push('id = ?');
+          binds.push(newKey);
+      }
+
+      if (body.longUrl) {
+        const urlStr = body.longUrl.trim();
+        let urlObj;
+        try {
+            urlObj = new URL(urlStr);
+        } catch {
+            return json({ error: 'Invalid URL format' }, 400, headers);
+        }
+        if (!['http:', 'https:'].includes(urlObj.protocol)) {
+            return json({ error: 'Only http and https URLs are allowed' }, 400, headers);
+        }
+        updates.push('original_url = ?');
+        binds.push(urlStr);
+      }
+      if ('maxClicks' in body) {
+        updates.push('max_clicks = ?');
+        binds.push(body.maxClicks ? parseInt(body.maxClicks, 10) : null);
+      }
+      if ('expiresAt' in body) {
+        updates.push('expires_at = ?');
+        binds.push(body.expiresAt ? parseInt(body.expiresAt, 10) : null);
+      }
+      if ('password' in body) {
+        updates.push('password_hash = ?');
+        binds.push(body.password ? await hashPassword(body.password) : null);
+      }
+
+      if (!updates.length) return json({ error: 'No changes' }, 400, headers);
+      
+      const sql = `UPDATE items SET ${updates.join(', ')} WHERE id = ?`;
+      binds.push(key);
+      await DB.prepare(sql).bind(...binds).run();
+
+      const updatedKey = newKey || key;
+      const fullShortUrl = new URL(updatedKey, `${url.origin}/`).toString();
+      
+      return json({ success: true, newKey: updatedKey, fullShortUrl }, 200, headers);
+    }
+
+    if (pathname.startsWith('/api/edit/') && request.method === 'GET') {
+      const auth = await requireAuth(DB, request);
+      if (!auth.ok) return json(auth.body, 401, headers);
+      const key = normalizeKey(decodeURIComponent(pathname.slice('/api/edit/'.length)));
+      const item = await DB.prepare(`SELECT original_url, max_clicks, expires_at, password_hash FROM items WHERE id = ? AND type = 'link'`).bind(key).first();
+      if (!item) return json({ error: 'Link not found' }, 404, headers);
+      return json({ url: item.original_url, maxClicks: item.max_clicks || 0, expiresAt: item.expires_at || null, hasPassword: !!item.password_hash }, 200, headers);
+    }
+
+    if (pathname === '/api/verify-link-password' && request.method === 'POST') {
+      const body = await readJsonOrForm(request);
+      const key = normalizeKey(body.key);
+      const password = body.password || '';
+
+      const ip = request.headers.get('CF-Connecting-IP') || '0.0.0.0';
+      const rlKey = `link-pw:${ip}:${key}`;
+      const now = Date.now();
+
+      let attempts = 0, blockedUntil = 0, blockCount = 0;
+      try {
+        const rec = await DB.prepare(`SELECT attempts, blocked_until, block_count FROM login_attempts WHERE key = ?`).bind(rlKey).first();
+        attempts = rec?.attempts || 0;
+        blockedUntil = rec?.blocked_until || 0;
+        blockCount = rec?.block_count || 0;
+        if (blockedUntil && now < blockedUntil) {
+          return json({ error: 'Too many attempts. Try again shortly.' }, 429, headers);
+        }
+      } catch (e) {}
+
+      const item = await DB.prepare(`SELECT original_url, password_hash, max_clicks, clicks, expires_at FROM items WHERE id = ? AND type = 'link'`).bind(key).first();
+      if (!item) return json({ error: 'Link not found' }, 404, headers);
+      if (!item.password_hash) return json({ error: 'Link is not password protected' }, 400, headers);
+
+      if (item.expires_at && now > item.expires_at) return json({ error: 'Link expired' }, 410, headers);
+      if (item.max_clicks && (item.clicks || 0) >= item.max_clicks) return json({ error: 'Click limit reached' }, 410, headers);
+
+      if (!(await verifyPassword(password, item.password_hash))) {
+        try {
+            attempts += 1;
+            if (attempts % 5 === 0) {
+              blockCount += 1;
+              blockedUntil = now + Math.min(60_000 * Math.pow(2, blockCount -1), 10 * 60_000);
+            }
+            await DB.prepare(`INSERT INTO login_attempts (key, attempts, last_attempt_at, blocked_until, block_count) VALUES (?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET attempts=excluded.attempts, last_attempt_at=excluded.last_attempt_at, blocked_until=excluded.blocked_until, block_count=excluded.block_count`).bind(rlKey, attempts, now, blockedUntil, blockCount).run();
+          } catch (e) {
+            console.error("Failed to update rate-limit key:", e);
+          }
+        return json({ error: 'Incorrect password' }, 401, headers);
+      }
+      
+      try {
+          await DB.prepare(`DELETE FROM login_attempts WHERE key = ?`).bind(rlKey).run();
+      } catch (e) {
+          console.error("Failed to clear rate-limit key:", e);
+      }
+
+      await DB.prepare(`UPDATE items SET clicks = COALESCE(clicks,0) + 1 WHERE id = ?`).bind(key).run();
+      return json({ success: true, redirectUrl: item.original_url }, 200, headers);
+    }
+
+    if (request.method === 'GET' && !pathname.startsWith('/api')) {
+      const key = normalizeKey(pathname.slice(1));
+      if (!key) {
+        return styledMessageResponse('Nothing here. Use the admin UI.', 404, headers);
+      }
+      const item = await DB.prepare(`SELECT original_url, password_hash, max_clicks, clicks, expires_at FROM items WHERE id = ? AND type = 'link'`).bind(key).first();
+      if (!item) {
+        return styledMessageResponse('Short link not found.', 404, headers);
+      }
+      const now = Date.now();
+      if (item.expires_at && now > item.expires_at) {
+        return styledMessageResponse('This link has expired.', 410, headers);
+      }
+      if (item.max_clicks && (item.clicks || 0) >= item.max_clicks) {
+        return styledMessageResponse('This link has reached its maximum clicks.', 410, headers);
+      }
+      if (item.password_hash) {
+        const redirect = new URL('/password_protected.html', PAGES_BASE_URL);
+        redirect.searchParams.set('key', key);
+        return Response.redirect(redirect.toString(), 302);
+      }
+      await DB.prepare(`UPDATE items SET clicks = COALESCE(clicks,0) + 1 WHERE id = ?`).bind(key).run();
+      const h = new Headers(headers);
+      for (const [k, v] of Object.entries(noCache)) h.set(k, v);
+      h.set('Location', item.original_url);
+      return new Response('', { status: 302, headers: h });
+    }
+
+    return styledMessageResponse('Not found', 404, headers);
+  }
 };

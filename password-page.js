@@ -1,4 +1,4 @@
-const WORKER_API_URL = 'https://links.domain.com';
+const WORKER_API_URL = 'https://links.yourdomain.com';
 const passwordForm = document.getElementById('password-form');
 const errorMessageDiv = document.getElementById('error-message');
 let shortLinkKey = '';
@@ -9,27 +9,29 @@ window.onload = () => {
     shortLinkKey = params.get('key');
     if (!shortLinkKey) {
         errorMessageDiv.textContent = 'Error: No short link key provided.';
-        errorMessageDiv.style.display = 'block';
-        passwordForm.style.display = 'none';
+        errorMessageDiv.classList.remove('hidden');
+        passwordForm.classList.add('hidden');
     }
 };
 
 passwordForm.addEventListener('submit', async (e) => {
     e.preventDefault();
     clearTimeout(errorTimeout);
-    errorMessageDiv.style.display = 'none';
+    errorMessageDiv.classList.add('hidden');
     errorMessageDiv.textContent = '';
 
     if (!shortLinkKey) {
         errorMessageDiv.textContent = 'Cannot proceed without a short link key.';
-        errorMessageDiv.style.display = 'block';
-        errorTimeout = setTimeout(() => { errorMessageDiv.style.display = 'none'; }, 2000);
+        errorMessageDiv.classList.remove('hidden');
+        errorTimeout = setTimeout(() => { errorMessageDiv.classList.add('hidden'); }, 2000);
         return;
     }
 
     const formData = new FormData(passwordForm);
+    formData.append('key', shortLinkKey);
+
     try {
-        const response = await fetch(`${WORKER_API_URL}/${shortLinkKey}`, {
+        const response = await fetch(`${WORKER_API_URL}/api/verify-link-password`, {
             method: 'POST',
             body: formData,
             credentials: 'include'
@@ -39,13 +41,13 @@ passwordForm.addEventListener('submit', async (e) => {
             window.location.href = data.redirectUrl;
         } else {
             errorMessageDiv.textContent = data.error || 'Incorrect password.';
-            errorMessageDiv.style.display = 'block';
-            errorTimeout = setTimeout(() => { errorMessageDiv.style.display = 'none'; }, 2000);
+            errorMessageDiv.classList.remove('hidden');
+            errorTimeout = setTimeout(() => { errorMessageDiv.classList.add('hidden'); }, 2000);
         }
     } catch (error) {
         console.error('Password submission error:', error);
         errorMessageDiv.textContent = 'Network error or server unreachable.';
-        errorMessageDiv.style.display = 'block';
-        errorTimeout = setTimeout(() => { errorMessageDiv.style.display = 'none'; }, 2000);
+        errorMessageDiv.classList.remove('hidden');
+        errorTimeout = setTimeout(() => { errorMessageDiv.classList.add('hidden'); }, 2000);
     }
 });
